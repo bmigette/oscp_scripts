@@ -32,14 +32,14 @@ LIGOLO_WAIT_TIME =  45
 
 # ==================================
 args = None
-
+expect_proc = None
 state = {}
 
 
 FORMAT = '%(asctime)s - %(levelname)s - %(message)s'
 logging.basicConfig(format=FORMAT, level=logging.INFO)  # Change level here
 logger = logging.getLogger(__name__)
-
+# TODO add file logging for output
 
 def cleanup():
     logger.info("Cleaning up ...")
@@ -269,46 +269,49 @@ def start_ligolo_remote():
     remotepath = os.path.join("/home", args.user, ligolo)
     
     run_remote_command(
-        f"sleep 20 && nohup {remotepath} --connect {args.local_ip}:{port} -ignore-cert > {remotepath}.log 2>&1 &", use_channel=True)
+        f"sleep 10 && nohup {remotepath} --connect {args.local_ip}:{port} -ignore-cert > {remotepath}.log 2>&1 &", use_channel=True)
 
+
+def pexpect_output_callback(output):
+    global args, state, expect_proc
+    try:
+        if "Agent joined" in output.decode("utf8"):
+            logger.info("Starting tunnel / listeners ...")
+            logger.debug(expect_proc.before)
+            expect_proc.sendline("session")
+            expect_proc.expect("Specify a session :")
+            logger.debug(expect_proc.before)
+            expect_proc.sendline("1")
+            expect_proc.expect('] »')
+            for i in range(1, args.listeners+1):
+                port = str(LIGOLO_BASE_PORT+i)
+
+                lcmd = f"listener_add --tcp --addr 0.0.0.0:{port} --to 127.0.0.1:{port}"
+                logger.info("Adding listener %s", lcmd)
+                expect_proc.sendline(lcmd)
+                state["ligolo_cmds"].append(lcmd)
+
+            tuncmd = f"start --tun ligolo{args.ligolo_id}"
+            state["ligolo_cmds"].append(tuncmd)
+            logger.info("Starting listener")
+            expect_proc.sendline(tuncmd)
+            logger.debug(expect_proc.before)
+
+    except:
+        pass
+    finally:
+        return output
 
 def start_ligolo_local():
-    global args, state
+    global args, state, expect_proc
     logger.info("Starting local ligolo proxy...")
     port = str(LIGOLO_BASE_PORT+args.ligolo_id)
     cmd = f"{LIGOLO_PROXY} -selfcert --laddr 0.0.0.0:{port}"
     state["ligolo_cmds"].append(cmd)
-    proc = pexpect.spawn(cmd, encoding='utf8')
+    expect_proc = pexpect.spawn(cmd, encoding='utf8')
     logger.info("Will attempt to set ligolo session automatically, and will go interactive in any case")
-    try:
-        proc.expect("Agent joined", timeout=LIGOLO_WAIT_TIME)
-        logger.debug(proc.before)
-        proc.sendline("session")
-        proc.expect("Specify a session :")
-        logger.debug(proc.before)
-        proc.sendline("1")
-        proc.expect('] »')
-        for i in range(1, args.listeners+1):
-            port = str(LIGOLO_BASE_PORT+i)
 
-            lcmd = f"listener_add --tcp --addr 0.0.0.0:{port} --to 127.0.0.1:{port}"
-            logger.info("Adding listener %s", lcmd)
-            proc.sendline(lcmd)
-            state["ligolo_cmds"].append(lcmd)
-
-        tuncmd = f"start --tun ligolo{args.ligolo_id}"
-        state["ligolo_cmds"].append(tuncmd)
-        logger.info("Starting listener")
-        proc.sendline(tuncmd)
-        logger.debug(proc.before)
-        logger.info("#"*50 + "\nLigolo Commands:\n%s\n" +
-                    "\n".join(state["ligolo_cmds"]))
-
-        logger.info("#"*50 + "\n%s\n" + "#"*50,
-                    "Entering Ligolo interactive mode, exit to terminate")
-    except:
-        pass
-    proc.interact()
+    expect_proc.interact(output_filter=pexpect_output_callback)
 
 
 def show_shell_commands():
