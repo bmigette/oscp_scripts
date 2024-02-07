@@ -41,7 +41,13 @@ logger = logging.getLogger(__name__)
 
 
 def cleanup():
-    pass
+    logger.info("Cleaning up ...")
+    run_local_command(f"ip link set ligolo{args.ligolo_id} down")
+    run_local_command(
+        f"ip tuntap del mode tun ligolo{args.ligolo_id}")
+
+    for route in state["routes"]:
+        run_local_command(f"ip route del {route}")
 
 
 def check_privileges():
@@ -59,11 +65,17 @@ def parse_args():
         required=True
     )
     parser.add_argument(
-        "-i",
+        "-id",
         "--ligolo-id",
         help="Ligolo Session ID",
         type=int,
         default=1
+    )
+    parser.add_argument(
+        "-i",
+        "--local-ip",
+        help="Local IP",
+        required=True
     )
     parser.add_argument(
         "-t",
@@ -95,15 +107,27 @@ def parse_args():
         help="Cleanup only (remove routes, tunnels, etc...)",
         action='store_true'
     )
+    parser.add_argument(
+        "-l",
+        "--listeners",
+        help="Automatically create ligolo listeners",
+        default=5,
+        type=int
+    )
     args = parser.parse_args()
     if not args.password:
         args.password = getpass()
     return args
 
 
-def get_command_output_lines(cmd, raise_if_stderr=True):
+def run_remote_command(cmd, raise_if_stderr=True):
     global args
     client = paramiko.SSHClient()
+    if "remote_shell_cmds" not in state:
+        state["remote_shell_cmds"] = [cmd]
+    else:
+        state["remote_shell_cmds"].append(cmd)
+
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
     client.connect(args.host, args.port, username=args.user,
                    password=args.password)
@@ -127,16 +151,19 @@ def write_state():
         f.write(json.dumps(state, indent=4))
 
 
-def copy_file(filename, remotepath="~"):
+def copy_file_to_remote(filename, remotepath="~"):
     global args
-    logger.debug("Copying %s to %s", filename, args.host)
+    basename = os.path.basename(filename)
+    remote_file = os.path.join(remotepath, basename)
+    logger.info("Copying file: scp %s  %s:%s",
+                filename, args.host, remote_file)
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
     ssh.connect(args.host, username=args.user, password=args.password)
     scp = ssh.open_sftp()
-    basename = os.path.basename(filename)
-    scp.put(filename, os.path.join(remotepath, basename))
+
+    scp.put(filename, remote_file)
 
     # Close the SCP client
     scp.close()
@@ -145,10 +172,16 @@ def copy_file(filename, remotepath="~"):
     ssh.close()
 
 
+def init():
+    state["shell_cmds"] = []
+    state["remote_shell_cmds"] = []
+    state["ligolo_cmds"] = []
+
+
 def get_remote_routes():
     global state, ROUTE_EXCLUDE
     state["routes"] = []
-    for route in get_command_output_lines("ip route"):
+    for route in run_remote_command("ip route"):
         route = route.strip()
         if not route:
             continue
@@ -166,35 +199,94 @@ def get_remote_routes():
     logger.info("Remote routes: %s", state["routes"])
     write_state()
 
+
 def run_local_command(cmd):
     global state
     logger.debug("Running local command %s", cmd)
-    proc = subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE,  stderr=subprocess.PIPE)
+    proc = subprocess.run(shlex.split(
+        cmd), stdout=subprocess.PIPE,  stderr=subprocess.PIPE)
     if proc.returncode != 0:
         logger.error("Error happened in command %s: %s", cmd, proc.stderr)
         proc.check_returncode()
     state["shell_cmds"].append(cmd)
-    logger.debug("%s:\n%s\nErr:\n%s",cmd, proc.stdout, proc.stderr)
+    logger.debug("%s:\n%s\nErr:\n%s", cmd, proc.stdout, proc.stderr)
     return proc.stdout
-    
+
 
 def create_tunnels_and_routes():
     global args
-    run_local_command()
+    run_local_command(
+        f"ip tuntap add user {os.getlogin()} mode tun ligolo{args.ligolo_id}")
+    run_local_command(f"ip link set ligolo{args.ligolo_id} up")
+    for route in state["routes"]:
+        run_local_command(f"ip route add {route} dev ligolo{args.ligolo_id}")
+
+
+def start_ligolo_remote():
+    global args
+    logger.info("Starting remote ligolo agent...")
+    ligolo = os.path.basename(LIGOLO_AGENT)
+    port = str(LIGOLO_BASE_PORT+args.ligolo_id)
+    run_remote_command(
+        f"sleep 30 && ~/{ligolo} --connect {args.local_ip}:{port} -ignore-cert &")
+
+
+def start_ligolo_local():
+    global args, state
+    logger.info("Starting local ligolo prpxy...")
+    port = str(LIGOLO_BASE_PORT+args.ligolo_id)
+    cmd = f"{LIGOLO_PROXY} -selfcert --laddr 0.0.0.0:{port}"
+    state["ligolo_cmds"].append(cmd)
+    proc = pexpect.spawn(cmd)
+    proc.expect("Agent joined")
+    logger.debug(proc.before)
+    proc.sendline("session")
+    proc.expect("Specify a session :")
+    logger.debug(proc.before)
+    proc.sendline("1")
+    proc.expect('] »')
+    for i in range(1, args.listeners+1):
+        port = str(LIGOLO_BASE_PORT+i)
+
+        lcmd = f"listener_add --tcp --addr 0.0.0.0:{port} --to 127.0.0.1:{port}"
+        logger.info("Adding listener %s", lcmd)
+        proc.sendline(lcmd)
+        state["ligolo_cmds"].append(lcmd)
+
+    tuncmd = f"start --tun ligolo{args.ligolo_id}"
+    state["ligolo_cmds"].append(tuncmd)
+    logger.info("Starting listener")
+    proc.sendline(tuncmd)
+    logger.debug(proc.before)
+    logger.info("#"*50 + "\nLigolo Commands:\n%s\n" +
+                "\n".join(state["ligolo_cmds"]))
+
+    logger.info("#"*50 + "\n%s\n" + "#"*50,
+                "Entering Ligolo interactive mode, exit to terminate")
+    proc.interact()
+
 
 def show_shell_commands():
     global state
-    logger.info("#"*50 + "\nShell Commands:\n%s\n" +
-                "#"*50, "\n".join(state["shell_cmds"]))
+    logger.info("#"*50 + "\nLocal Shell Commands:\n%s\n" +
+                "#"*50 + "\nRemote Shell Commands:\n%s\n" + "#"*50,
+                "\n".join(state["shell_cmds"]),
+                "\n".join(state["remote_shell_cmds"]))
 
 
 def main():
     global args
     check_privileges()
+    init()
     args = parse_args()
     get_remote_routes()
     create_tunnels_and_routes()
+    copy_file_to_remote(LIGOLO_AGENT)
+    start_ligolo_remote()
     show_shell_commands()
+    write_state()
+    start_ligolo_local()
+    cleanup()
 
 
 if __name__ == "__main__":
