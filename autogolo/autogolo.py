@@ -17,7 +17,7 @@ import shlex
 #####  CONFIGURATION ######
 # REPLACE PATHS HERE
 LIGOLO_AGENT = "/opt/ligolo-ng/agentlin64"
-LIGOLO_PROXY = "/opt/ligolo-ng/proxyin64"
+LIGOLO_PROXY = "/opt/ligolo-ng/proxylin64"
 
 CACHE_PATH = "/tmp/autogolo"
 
@@ -28,6 +28,7 @@ IGNORE_SLASH32 = True
 
 # Base ligolo port: (effective port will be this + ligolo_id)
 LIGOLO_BASE_PORT = 11600
+LIGOLO_WAIT_TIME =  45
 
 # ==================================
 args = None
@@ -42,13 +43,15 @@ logger = logging.getLogger(__name__)
 
 def cleanup():
     logger.info("Cleaning up ...")
-    run_local_command(f"ip link set ligolo{args.ligolo_id} down")
-    run_local_command(
-        f"ip tuntap del mode tun ligolo{args.ligolo_id}")
 
     for route in state["routes"]:
-        run_local_command(f"ip route del {route}")
-
+        logger.info(f"ip route del {route}")
+        run_local_command(f"ip route del {route}", True)
+    
+    logger.info(f"Deleting tunnel ligolo{args.ligolo_id}")
+    run_local_command(f"ip link set ligolo{args.ligolo_id} down", True)
+    run_local_command(
+        f"ip tuntap del mode tun ligolo{args.ligolo_id}", True)
 
 def check_privileges():
     if not os.environ.get("SUDO_UID") and os.geteuid() != 0:
@@ -110,7 +113,7 @@ def parse_args():
     parser.add_argument(
         "-l",
         "--listeners",
-        help="Automatically create ligolo listeners",
+        help="Automatically create this amount of ligolo listeners. Default 5.",
         default=5,
         type=int
     )
@@ -120,7 +123,7 @@ def parse_args():
     return args
 
 
-def run_remote_command(cmd, raise_if_stderr=True):
+def run_remote_command(cmd, raise_if_stderr=True, use_channel = False):
     global args
     client = paramiko.SSHClient()
     if "remote_shell_cmds" not in state:
@@ -132,27 +135,54 @@ def run_remote_command(cmd, raise_if_stderr=True):
     client.connect(args.host, args.port, username=args.user,
                    password=args.password)
     logger.debug("Executing %s on host %s", cmd, args.host)
-    stdin, stdout, stderr = client.exec_command(cmd)
-    stdout = stdout.readlines()
-    stderr = stderr.strip()
-    if not stderr and raise_if_stderr:
-        logger.error("Error in command %s:\n%s", cmd, stderr)
-        raise Exception(f"Error in command {cmd}:\n{stderr}")
+    if not use_channel:
+        stdin, stdout, stderr = client.exec_command(cmd)
+        stdout = stdout.readlines()
+        stderr = stderr.read().strip()
+        if stderr and raise_if_stderr:
+            logger.error("Error in command %s:\n%s", cmd, stderr)
+            raise Exception(f"Error in command {cmd}:\n{stderr}")
+    else:
+        transport = client.get_transport()
+        channel = transport.open_session()
+        channel.exec_command(cmd) 
+        stdout = "" # TODO See if we can get output, although don't need it rn
     client.close()
     logger.debug("%s = %s", cmd, stdout)
 
     return stdout
 
+def run_local_command(cmd, ignore_err = False):
+    global state
+    logger.debug("Running local command %s", cmd)
+    proc = subprocess.run(shlex.split(
+        cmd), stdout=subprocess.PIPE,  stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        logger.error("Error happened in command %s: %s", cmd, proc.stderr)
+        if ignore_err:
+            return
+        proc.check_returncode()
+    state["shell_cmds"].append(cmd)
+    stdout = proc.stdout
+    if type(stdout).__name__ == "bytes":
+        stdout = stdout.decode("utf-8")
+        stdout = [x.strip() for x in stdout.split("\n")]
+    logger.debug("%s:\n%s\nErr:\n%s", cmd, stdout, proc.stderr)
+    return stdout
 
 def write_state():
     global state, args, CACHE_PATH
     logger.debug("Writing state...")
+    if not os.path.isdir(CACHE_PATH):
+        os.makedirs(CACHE_PATH, exist_ok=True)
     with open(os.path.join(CACHE_PATH, f"{args.ligolo_id}.json"), "w") as f:
         f.write(json.dumps(state, indent=4))
 
 
-def copy_file_to_remote(filename, remotepath="~"):
+def copy_file_to_remote(filename, remotepath=None):
     global args
+    if not remotepath:
+        remotepath = os.path.join("/home", args.user)
     basename = os.path.basename(filename)
     remote_file = os.path.join(remotepath, basename)
     logger.info("Copying file: scp %s  %s:%s",
@@ -181,6 +211,9 @@ def init():
 def get_remote_routes():
     global state, ROUTE_EXCLUDE
     state["routes"] = []
+    local_routes = get_local_routes()
+        
+        
     for route in run_remote_command("ip route"):
         route = route.strip()
         if not route:
@@ -195,26 +228,32 @@ def get_remote_routes():
         if "/32" in route and IGNORE_SLASH32:
             logger.debug("Ignoring /32 route %s", route)
             continue
+        if route in local_routes:
+            logger.info("Skipping local route %s", route)
+            continue
         state["routes"].append(route)
     logger.info("Remote routes: %s", state["routes"])
     write_state()
 
+def get_local_routes():
+    routes = []
+    for route in run_local_command("ip route"):
+        route = route.strip()
+        if not route:
+            continue
+        if "default" in route:
+            continue
+       
+        route = route.split(" ")[0]        
+        routes.append(route)
+    logger.info("local routes: %s", routes)
+    return routes
+    
 
-def run_local_command(cmd):
-    global state
-    logger.debug("Running local command %s", cmd)
-    proc = subprocess.run(shlex.split(
-        cmd), stdout=subprocess.PIPE,  stderr=subprocess.PIPE)
-    if proc.returncode != 0:
-        logger.error("Error happened in command %s: %s", cmd, proc.stderr)
-        proc.check_returncode()
-    state["shell_cmds"].append(cmd)
-    logger.debug("%s:\n%s\nErr:\n%s", cmd, proc.stdout, proc.stderr)
-    return proc.stdout
 
 
 def create_tunnels_and_routes():
-    global args
+    global args, state
     run_local_command(
         f"ip tuntap add user {os.getlogin()} mode tun ligolo{args.ligolo_id}")
     run_local_command(f"ip link set ligolo{args.ligolo_id} up")
@@ -227,48 +266,54 @@ def start_ligolo_remote():
     logger.info("Starting remote ligolo agent...")
     ligolo = os.path.basename(LIGOLO_AGENT)
     port = str(LIGOLO_BASE_PORT+args.ligolo_id)
+    remotepath = os.path.join("/home", args.user, ligolo)
+    
     run_remote_command(
-        f"sleep 30 && ~/{ligolo} --connect {args.local_ip}:{port} -ignore-cert &")
+        f"sleep 20 && nohup {remotepath} --connect {args.local_ip}:{port} -ignore-cert > {remotepath}.log 2>&1 &", use_channel=True)
 
 
 def start_ligolo_local():
     global args, state
-    logger.info("Starting local ligolo prpxy...")
+    logger.info("Starting local ligolo proxy...")
     port = str(LIGOLO_BASE_PORT+args.ligolo_id)
     cmd = f"{LIGOLO_PROXY} -selfcert --laddr 0.0.0.0:{port}"
     state["ligolo_cmds"].append(cmd)
-    proc = pexpect.spawn(cmd)
-    proc.expect("Agent joined")
-    logger.debug(proc.before)
-    proc.sendline("session")
-    proc.expect("Specify a session :")
-    logger.debug(proc.before)
-    proc.sendline("1")
-    proc.expect('] »')
-    for i in range(1, args.listeners+1):
-        port = str(LIGOLO_BASE_PORT+i)
+    proc = pexpect.spawn(cmd, encoding='utf8')
+    logger.info("Will attempt to set ligolo session automatically, and will go interactive in any case")
+    try:
+        proc.expect("Agent joined", timeout=LIGOLO_WAIT_TIME)
+        logger.debug(proc.before)
+        proc.sendline("session")
+        proc.expect("Specify a session :")
+        logger.debug(proc.before)
+        proc.sendline("1")
+        proc.expect('] »')
+        for i in range(1, args.listeners+1):
+            port = str(LIGOLO_BASE_PORT+i)
 
-        lcmd = f"listener_add --tcp --addr 0.0.0.0:{port} --to 127.0.0.1:{port}"
-        logger.info("Adding listener %s", lcmd)
-        proc.sendline(lcmd)
-        state["ligolo_cmds"].append(lcmd)
+            lcmd = f"listener_add --tcp --addr 0.0.0.0:{port} --to 127.0.0.1:{port}"
+            logger.info("Adding listener %s", lcmd)
+            proc.sendline(lcmd)
+            state["ligolo_cmds"].append(lcmd)
 
-    tuncmd = f"start --tun ligolo{args.ligolo_id}"
-    state["ligolo_cmds"].append(tuncmd)
-    logger.info("Starting listener")
-    proc.sendline(tuncmd)
-    logger.debug(proc.before)
-    logger.info("#"*50 + "\nLigolo Commands:\n%s\n" +
-                "\n".join(state["ligolo_cmds"]))
+        tuncmd = f"start --tun ligolo{args.ligolo_id}"
+        state["ligolo_cmds"].append(tuncmd)
+        logger.info("Starting listener")
+        proc.sendline(tuncmd)
+        logger.debug(proc.before)
+        logger.info("#"*50 + "\nLigolo Commands:\n%s\n" +
+                    "\n".join(state["ligolo_cmds"]))
 
-    logger.info("#"*50 + "\n%s\n" + "#"*50,
-                "Entering Ligolo interactive mode, exit to terminate")
+        logger.info("#"*50 + "\n%s\n" + "#"*50,
+                    "Entering Ligolo interactive mode, exit to terminate")
+    except:
+        pass
     proc.interact()
 
 
 def show_shell_commands():
     global state
-    logger.info("#"*50 + "\nLocal Shell Commands:\n%s\n" +
+    logger.info("\n" + "#"*50 + "\nLocal Shell Commands:\n%s\n" +
                 "#"*50 + "\nRemote Shell Commands:\n%s\n" + "#"*50,
                 "\n".join(state["shell_cmds"]),
                 "\n".join(state["remote_shell_cmds"]))
@@ -278,15 +323,20 @@ def main():
     global args
     check_privileges()
     init()
+    
     args = parse_args()
-    get_remote_routes()
-    create_tunnels_and_routes()
-    copy_file_to_remote(LIGOLO_AGENT)
-    start_ligolo_remote()
-    show_shell_commands()
-    write_state()
-    start_ligolo_local()
-    cleanup()
+    try:            
+        get_remote_routes()
+        create_tunnels_and_routes()
+        copy_file_to_remote(LIGOLO_AGENT)
+        start_ligolo_remote()
+        show_shell_commands()
+        write_state()
+        start_ligolo_local()
+    except Exception as e:
+        logger.error("Error: %s", e, exc_info=True)
+    finally:
+        cleanup()
 
 
 if __name__ == "__main__":
