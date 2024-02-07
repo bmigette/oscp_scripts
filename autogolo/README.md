@@ -1,11 +1,12 @@
 # Description
 Wrapper of ligolo-ng
+
 The script will:
--Connect to remote target via SSH and get routes
--Create tunnel and add routes of remote host through that tunnel (does not install any route that maches your own routes)
--copy the ligolo agent to remote host and start it
--Automatically start tunnnels and add listeners when agent connects
--Enters interactive mode to interact with ligolo
+- Connect to remote target via SSH and get routes
+- Create tunnel and add routes of remote host through that tunnel (does not install any route that maches your own routes)
+- copy the ligolo agent to remote host and start it
+- Automatically start tunnnels and add listeners when agent connects
+- Enters interactive mode to interact with ligolo
 
 When the script is terminated (ie when you type 'exit' from ligolo), it will remove tunnels and routes
 
