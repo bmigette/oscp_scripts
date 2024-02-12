@@ -117,8 +117,15 @@ def parse_args():
         default=5,
         type=int
     )
+    parser.add_argument(
+        "-pvk",
+        "--private-key",
+        help="Use Private key for auth (RSA, no password)",
+        default=None
+    )
     args = parser.parse_args()
-    if not args.password:
+    
+    if not args.password and not args.private_key:
         args.password = getpass()
     return args
 
@@ -132,8 +139,14 @@ def run_remote_command(cmd, raise_if_stderr=True, use_channel = False):
         state["remote_shell_cmds"].append(cmd)
 
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(args.host, args.port, username=args.user,
-                   password=args.password)
+    
+    if args.private_key:
+        key = paramiko.RSAKey.from_private_key_file(args.private_key)
+        client.connect(args.host, args.port, username=args.user, key = key)
+    else:
+        client.connect(args.host, args.port, username=args.user, password=args.password)
+        
+
     logger.debug("Executing %s on host %s", cmd, args.host)
     if not use_channel:
         stdin, stdout, stderr = client.exec_command(cmd)
@@ -189,8 +202,12 @@ def copy_file_to_remote(filename, remotepath=None):
                 filename, args.host, remote_file)
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
-    ssh.connect(args.host, username=args.user, password=args.password)
+    if args.private_key:
+        key = paramiko.RSAKey.from_private_key_file(args.private_key)
+        ssh.connect(args.host, args.port, username=args.user, key = key)
+    else:
+        ssh.connect(args.host, args.port, username=args.user, password=args.password)
+        
     scp = ssh.open_sftp()
 
     scp.put(filename, remote_file)
