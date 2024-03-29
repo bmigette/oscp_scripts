@@ -60,6 +60,7 @@ def check_privileges():
 
 
 def parse_args():
+    global LIGOLO_BASE_PORT
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-ho",
@@ -104,6 +105,14 @@ def parse_args():
         help="Port",
         default=22
     )
+    
+    parser.add_argument(
+        "-lp",
+        "--ligolo-port",
+        help="Ligolo Port",
+        default=LIGOLO_BASE_PORT,
+        type=int
+    )
     parser.add_argument(
         "-c",
         "--clean",
@@ -120,13 +129,14 @@ def parse_args():
     parser.add_argument(
         "-pvk",
         "--private-key",
-        help="Use Private key for auth (RSA, no password)",
+        help="Use Private key for auth (PEM RSA, no password)",
         default=None
     )
     args = parser.parse_args()
     
     if not args.password and not args.private_key:
         args.password = getpass()
+    LIGOLO_BASE_PORT = args.ligolo_port
     return args
 
 
@@ -286,7 +296,7 @@ def start_ligolo_remote():
     remotepath = os.path.join("/home", args.user, ligolo)
     
     run_remote_command(
-        f"sleep 10 && nohup {remotepath} --connect {args.local_ip}:{port} -ignore-cert > {remotepath}.log 2>&1 &", use_channel=True)
+        f"sleep 10 && chmod +x {remotepath}  && nohup {remotepath} --connect {args.local_ip}:{port} -ignore-cert > {remotepath}.log 2>&1 &", use_channel=True)
 
 
 def pexpect_output_callback(output):
